@@ -1,0 +1,27 @@
+name: Push Description & README to Docker Hub
+
+on:
+  push:
+    branches:
+    - master
+    paths: #ensures this workflow is only processed when the README.md changes or this file but not any other file.
+        - 'README.md'
+        - '.github/workflows/update-dockerhub-description-readme.yml'
+
+jobs:
+  PushContainerReadme:
+    runs-on: ubuntu-latest
+    name: Push README to Docker Hub
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v2
+      - name: push README to Dockerhub
+        uses: christian-korneck/update-container-description-action@v1
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME}}
+          DOCKER_PASS: ${{ secrets.DOCKERHUB_PASSWORD}} #this must be a password it can't be API token or personal toke due to issue with way API works
+        with:
+          destination_container_repo: nebulous/infinitude
+          provider: dockerhub
+          short_description: 'Infinitude Carrier/Bryant network thermostat control'
+          readme_file: 'README.md'

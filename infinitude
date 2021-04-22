@@ -32,8 +32,8 @@ if (my $config_json = $store->get('infinitude.json')) { #migrate older format co
 	$config_file->spew($config_json);
 	$store->remove('infinitude.json');
 } else {
-	# Default configuration if no state/infinitude.json file is found.
-	# customize config by editing state/infinitude.json
+	# Default configuration if no infinitude.json file is found.
+	# customize config by editing infinitude.json
 	try { $config = decode_json($config_file->slurp) };
 
 	$config //= {
@@ -82,7 +82,7 @@ hook before_dispatch => sub {
 			$o_url->scheme('https');
 			$o_req->url($o_url);
 
-			$c->app->log->debug("No cache for $nk. Make Carrier request");
+			$c->app->log->info("No cache for $nk. Make Carrier request");
 			$store->set("req-$nk.txt", $o_req->to_string);
 			#say "REQUEST:\n".$o_req->to_string."\n------------";
 			my $ua = Mojo::UserAgent->new;
@@ -90,16 +90,17 @@ hook before_dispatch => sub {
 			$store->set("res-$nk.txt", $tx->res->to_string);
 			#say "RESPONSE:\n".$store->get("res-$nk.txt");
 			$c->stash->{pass_res} = $tx->res->body;
+			$c->stash->{format} = 'xml' if ($tx->res->headers->content_type//'') =~ /xml/;
 			$store->set("$nk.xml", $tx->res->body)
 			  if ($tx->res->headers->content_type//'' =~ /xml/);
 		} else {
-			$c->app->log->debug("$nk cached or passthru disabled");
+			$c->app->log->info("$nk cached or passthru disabled");
 		}
 
 		#Mangle Internet-bound request to self
 		my $appurl = $c->url_for('/');
 		$url->base($appurl->base);
-		$c->app->log->debug($url);
+		$c->app->log->info($url);
 
 		#Stuff data into store
 		if (my $data = $c->req->param('data')) {
@@ -107,14 +108,14 @@ hook before_dispatch => sub {
 			try {
 				$xml = XML::Simple::Minded->new($data);
 				my ($store_key) = $url->path  =~ /.*\/(.*)$/;
-				$c->app->log->debug("Saving $store_key");
+				$c->app->log->info("Saving $store_key");
 				$store->set("$store_key.raw", $data);
 				$store->set("$store_key.xml" , $xml.'');
 				$store->set("$store_key.json", $xml->_as_json);
 				$c->stash(store_key=>$store_key);
 			} catch {
 				$c->stash('error','true');
-				$c->app->log->debug($url, shortmess(), "Caught error: $_".$@);
+				$c->app->log->info($url, shortmess(), "Caught error: $_".$@);
 				$store->set("error-".time() => 'url:'.$url."\nerror: $_\ndata:".$data);
 			};
 		}
@@ -156,7 +157,8 @@ any '/api/:zone_id/hold' => sub {
 	$zone->holdActivity([$setting->{activity}]);
 
 	# default to about an hour from now
-	$setting->{until} = &qtr_hr($c->req->param('until') || ((localtime)[2] + 1));
+	my $until = $c->req->param('until') || ((localtime)[2] + 1);
+	$setting->{until} = $until eq 'forever' ? {} : &qtr_hr($until);
 	$zone->otmr([$setting->{until}]);
 
 	$store->set('systems.xml',  $xml.'');
@@ -182,7 +184,7 @@ sub api_stat {
        if ($prop =~ /^[A-Z]/i) {
 	       my $val = $status->{$prop};
 	       $val = $val->[0] if ref($val) eq 'ARRAY' && scalar(@$val)==1;
-	       $val *=1 if $val =~ /^[\.\d]+$/;
+	       $val *=1 if defined($val) and $val =~ /^[\.\d]+$/;
 	       $status = { $prop=>$val };
        }
        $c->render(json=>$status);
@@ -314,7 +316,7 @@ get '/systems/:id/config' => sub {
 get '/systems/:id' => sub {
 	my $c = shift;
 	my $xml = $store->get('systems.xml');
-	$c->app->log->debug("-------- Getting systems.xml (".$c->stash('id').") from infinitude.");
+	$c->app->log->info("-------- Getting systems.xml (".$c->stash('id').") from infinitude.");
 	$xml
 		? $c->render(text=>$xml.'', format=>'xml')
 		: $c->render(text=>'', format=>'txt');
@@ -339,7 +341,7 @@ post '/systems/:system_id/status' => sub {
 
 	# if infinitude has no changes, and this is a carrier passthru request, return carrier's response
 	if (!$changes and $c->stash->{pass_res}) {
-	  $c->app->log->debug("********** Check Carrier/Bryant change flags ****************");
+	  $c->app->log->info("********** Check Carrier/Bryant change flags ****************");
 	  $xml = XML::Simple::Minded->new($c->stash->{pass_res});
 	  $xml->status->pingRate([12]);
 	  $changes = $xml->status->serverHasChanges eq 'true' ? 1 : 0;
@@ -347,7 +349,7 @@ post '/systems/:system_id/status' => sub {
 	}
 
 	if ($changes) {
-	  $c->app->log->debug("********** There are changes. ****************");
+	  $c->app->log->info("********** There are changes. ****************");
 	  $store->set(changes=>'');
 	}
 	$c->render(text=>$xml, format=>'xml');
@@ -355,7 +357,7 @@ post '/systems/:system_id/status' => sub {
 
 any '/systems/:system_id/:part' => sub {
 	my $c = shift;
-	$c->app->log->debug('Unimplemented request: ' . $c->stash->{'part'});
+	$c->app->log->info('Unimplemented request: ' . $c->stash->{'part'});
 	$c->render(text=>'', format=>'txt');
 };
 
@@ -364,20 +366,21 @@ my $stream;
 my $carbus;
 websocket '/serial' => sub {
 	my $c = shift;
-	if ($config->{serial_socket} or $config->{serial_tty} and -e $config->{serial_tty}) {
+	if ($config->{serial_socket} or ($config->{serial_tty} and -e $config->{serial_tty})) {
 		if ($config->{serial_socket}) {
-			$c->app->log->debug('Attempting to access '.$config->{serial_socket});
+			$c->app->log->info('Attempting to access '.$config->{serial_socket});
 			my ($host,$port) = split(':',$config->{serial_socket});
 			$handle ||= IO::Socket::IP->new(
 				PeerHost => $host//'localhost',
 				PeerPort => $port//'telnet',
 			);
 		} else {
-			$c->app->log->debug('Attempting to access '.$config->{serial_tty});
+			$c->app->log->info('Attempting to access '.$config->{serial_tty});
 			$handle ||= IO::Termios->open($config->{serial_tty},"38400,8,n,1");
 		}
+		return unless $handle;
 
-		$stream ||= Mojo::IOLoop::Stream->new($handle);
+		$stream ||= Mojo::IOLoop::Stream->new($handle)->timeout(90);
 		$carbus ||= CarBus->new(async=>1);
 
 		$stream->on(read => sub {
@@ -399,16 +402,19 @@ websocket '/serial' => sub {
 		});
 		$stream->on(error=>sub {
 			my ($stream, $err) = @_;
-			$c->app->log->debug("ERROR $err");
+			$c->app->log->info("ERROR $err");
 		});
 		$stream->on(close=>sub {
 			my ($stream) = @_;
-			$c->app->log->debug("Closed stream");
+			$c->app->log->info("Closed stream");
 		});
-
+		$stream->on(timeout=>sub {
+			my ($stream) = @_;
+			$c->app->log->info("Inactive stream timeout");
+		});
 		$c->on('finish' => sub {
 			my ($c, $code) = @_;
-			$c->app->log->debug("Closed: $code");
+			$c->app->log->info("Closed: $code");
 			$stream->stop if $stream;
 			$stream = undef;
 			$handle = undef;
@@ -416,15 +422,31 @@ websocket '/serial' => sub {
 		$stream->start;
 		$stream->reactor->start unless $stream->reactor->is_running;
 	} else {
-		$c->spp->log->debug("Websocket opened, but no serial device found")
+		$c->app->log->info("Websocket opened, but no streaming source found")
 	}
 };
 
-get '/:key' => sub {
+any '/*catchall' => sub {
 	my $c = shift;
-	my $store_key = join('.', $c->stash('key'), $c->stash('format'));
-	my $text = $store->get($store_key) // "Infinitude doesn't know about $store_key yet";
-	$c->render(text=>$text, format=>$c->stash('format')||'text');
+	my $store_key = $c->stash('catchall');
+	$store_key =~ s/\//-/g;
+	my $text = $c->stash->{pass_res}
+	        || $store->get($store_key)
+		|| $store->get("$store_key.xml")
+		|| $store->get("$store_key.json")
+		// '';
+
+	my $format = $c->stash('format')     ? $c->stash('format')
+	           : $store_key =~ /\.json$/ ? 'json'
+		   : $text =~ /^\s*{/        ? 'json'
+	           : $store_key =~ /\.xml$/  ? 'xml'
+	           : $text =~ /^\s*</        ? 'xml'
+		   :                           'text';
+
+	$text = '{}' if ($format eq 'json' and !$text);
+	$text = "Infinitude doesn't know how to ".$c->req->method." $store_key" unless $text;
+
+	$c->render(text=>$text, format=>$format);
 };
 
 app->start;
